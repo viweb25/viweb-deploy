@@ -1,0 +1,184 @@
+# Production stack for one cloud server.
+#
+#   Internet ──443──▶ web (Caddy: HTTPS + React files) ──/api──▶ api ──▶ postgres / redis
+#                                                                   └──▶ inference (YOLO)
+#   training-worker ◀── polls postgres for queued jobs, writes models to the runs volume
+#
+# Only `web` publishes ports. Everything else is reachable only inside this Docker network.
+# Image tags come from versions.env (committed). Secrets come from .env (server only).
+# Run through scripts/deploy.sh, never by hand, so both env files are always loaded.
+name: viweb
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-database-url: &database-url postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+services:
+  web:
+    <<: *service
+    image: ${REGISTRY}/viweb-frontend:${FRONTEND_TAG}
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    <<: *service
+    image: ${REGISTRY}/viweb-ai:${API_TAG}
+    # The API is only reachable from Caddy, so trusting its X-Forwarded-For is safe and
+    # gives sign-in rate limiting the real client IP.
+    command:
+      - uvicorn
+      - vi_api.bootstrap:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --workers=${API_WORKERS:-2}
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+      - --no-server-header
+    environment:
+      DATABASE_URL: *database-url
+      REDIS_CACHE_URL: redis://redis:6379/1
+      INFERENCE_URL: http://inference:8001
+      APP_ORIGIN: https://${DOMAIN}
+      # Empty disables the unauthenticated local-demo endpoints.
+      VI_DEMO_IMAGE_DIR: ""
+      VI_TRAINING_IMAGE_DIR: /var/lib/viweb-demo/training
+      VI_TRAINING_RUN_DIR: /var/lib/viweb-training
+    volumes:
+      - uploads:/var/lib/viweb-demo
+      - training-runs:/var/lib/viweb-training:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      inference:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 6
+
+  worker:
+    <<: *service
+    image: ${REGISTRY}/viweb-ai:${API_TAG}
+    command: ["celery", "-A", "worker.app:app", "worker", "--loglevel=info", "--concurrency=2", "--queues=platform"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    # One-shot job: applies new database migrations, then exits. The API waits for it.
+    image: ${REGISTRY}/viweb-db:${DB_TAG}
+    restart: "no"
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  inference:
+    <<: *service
+    image: ${REGISTRY}/viweb-inference:${INFERENCE_TAG}
+    command: ["uvicorn", "vi_inference.main:app", "--host=0.0.0.0", "--port=8001"]
+    environment:
+      VI_TRAINING_RUN_DIR: /var/lib/viweb-training
+      # Put a reviewed checkpoint at models/best.pt and set VI_YOLO_WEIGHTS=/models/best.pt.
+      VI_YOLO_WEIGHTS: ${VI_YOLO_WEIGHTS:-/opt/viweb/yolo11n.pt}
+      VI_DEMO_OLLAMA_URL: ""
+    volumes:
+      - ./models:/models:ro
+      - training-runs:/var/lib/viweb-training:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "${INFERENCE_CPUS:-2}"
+          memory: ${INFERENCE_MEMORY:-3g}
+
+  training-worker:
+    <<: *service
+    image: ${REGISTRY}/viweb-inference:${INFERENCE_TAG}
+    command: ["python", "-m", "vi_inference.training_worker"]
+    environment:
+      DATABASE_URL: *database-url
+      VI_TRAINING_IMAGE_DIR: /var/lib/viweb-demo/training
+      VI_TRAINING_RUN_DIR: /var/lib/viweb-training
+      VI_TRAINING_EPOCHS: ${VI_TRAINING_EPOCHS:-100}
+    volumes:
+      - uploads:/var/lib/viweb-demo:ro
+      - training-runs:/var/lib/viweb-training
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # CPU training is heavy. Cap it so the website stays responsive while a model trains.
+    deploy:
+      resources:
+        limits:
+          cpus: "${TRAINING_CPUS:-2}"
+          memory: ${TRAINING_MEMORY:-6g}
+
+  postgres:
+    <<: *service
+    image: postgres:16.8-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    <<: *service
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres:
+  redis:
+  uploads:
+  training-runs:
+  caddy-data:
+  caddy-config:

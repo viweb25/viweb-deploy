@@ -1,0 +1,53 @@
+# Caddy runs inside the viweb-frontend image. It:
+#   1. gets and renews the HTTPS certificate for DOMAIN from Let's Encrypt automatically,
+#   2. serves the built React app from /srv,
+#   3. forwards /api and /health/live to the API container.
+# The browser sees one origin (https://DOMAIN), so cookies stay SameSite=Strict and the
+# camera works (browsers allow getUserMedia only on HTTPS).
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(self), microphone=(), geolocation=(), payment=()"
+		-Server
+	}
+
+	# Local-only demo endpoints and API docs are never public.
+	@blocked path /api/v1/demo/examples /api/v1/demo/examples/* /docs /docs/* /redoc /openapi.json /health/ready
+	handle @blocked {
+		respond 404
+	}
+
+	@api path /api/* /health/live
+	handle @api {
+		# Photos are at most 5 MiB; dataset saves are JSON and stay well below this.
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy api:8000 {
+			# Training previews and inspection can take up to ~95 s on CPU.
+			transport http {
+				response_header_timeout 120s
+			}
+		}
+	}
+
+	handle {
+		root * /srv
+		# Vite fingerprints files in /assets, so they can be cached for a year.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@page not path /assets/*
+		header @page Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}
