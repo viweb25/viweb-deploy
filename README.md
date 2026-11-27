@@ -94,6 +94,11 @@ chmod 600 .env
 openssl rand -hex 32   # use this as POSTGRES_PASSWORD
 ```
 
+For workspace invitations and password recovery, set `SMTP_HOST`, `SMTP_FROM`, and
+`SMTP_PORT` (default 587) in the server's `.env`. The API uses SMTP with STARTTLS.
+Set `SMTP_USERNAME` and `SMTP_PASSWORD` when your relay requires authentication.
+Use an approved sender for your relay. Links use the configured application domain.
+
 Let the server pull private images: create a GitHub token (classic, scope
 `read:packages` only) and run, as `deploy`:
 
